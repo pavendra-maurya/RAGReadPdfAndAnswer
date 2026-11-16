@@ -1,0 +1,702 @@
+# AST-33916: Admin UI (`https://<FQDN>/admin`) returns ERR_CONNECTION_REFUSED some time after restart (Horizon 8 2606)
+
+| Item | Value |
+|---|---|
+| Node analysed | `dayhview8cs03.daysup.com` (internal CS) |
+| Logs | `debug-2026-10-27-092150.txt`, `debug-2026-10-27-122342.txt`, `netstat-an.txt` (captured ≈14:07, CS IP **22.1.11.95**, during the outage) |
+| ws_TunnelService processes in logs | PID `0x2674` (until 10:34:56 restart), PID `0x192C` (started 10:36:56) |
+| Product build (log) | `ws_TunnelService ... version=8.19.0 build-32120531883` (2606), Java `21.0.11.0.1` |
+| Code analysed | `hzn-srv-legacy/vdi` at `release/2606` (`v2606`, commit `8025962c00`); history from `euc-vdi/horizon-server` tags `v2512`, `v2603`, `v2606`, `v2609` |
+
+---
+
+## 1. Summary for the customer
+
+The Admin console is served by **ws_TunnelService** (Secure Gateway, port 443). Every new HTTPS connection gets a TLS handshake on a small, fixed pool of **30 worker threads**.
+
+On 2606, a worker thread can get **stuck forever** when a client opens a connection to port 443, starts the TLS handshake, and then goes silent. Typical causes are a laptop going to sleep, a Wi-Fi or VPN drop, or a firewall silently dropping an idle session. Three things together make the hang permanent:
+
+* The socket has no read timeout during the handshake.
+* The built-in "kill a slow handshake" mechanism cannot unblock the thread.
+* The 5 helper threads that try to close those connections get stuck as well.
+
+Each stuck connection permanently uses up one of the 30 threads. After enough of them, the pool and its 30-slot queue are full. The thread that accepts new connections on port 443 then spins (using CPU) and **stops accepting connections**. Windows rejects new connection attempts once the listen backlog fills, so the browser shows **ERR_CONNECTION_REFUSED**, even though every Horizon service still shows *Running* and port 443 is still owned by `ws_TunnelService.exe`. Restarting the service clears the stuck threads, so the problem returns after the same number of "bad" client connections. That can take minutes or hours depending on how many internal clients there are.
+
+Internal nodes are affected because they take TLS connections **directly** from hundreds of end-user devices. External nodes only receive connections from UAG, which completes or cleanly closes its handshakes.
+
+**The netstat confirms this and finds the "every 15 minutes" trigger (section 2.5):**
+
+* Exactly **30 long-lived ESTABLISHED** connections on 443 were accepted by the tunnel and never finished. That is one per worker thread.
+* **12 of those 30 (40%) come from the Connection Server itself** (`22.1.11.95 → 22.1.11.95:443`). Some local process on the server opens a TCP connection to its own port 443 **every 15 minutes, at xx:01:44, xx:16:44, xx:31:44 and xx:46:44**. It **never sends a TLS ClientHello** and **never closes the connection**. Each one permanently consumes a worker thread. This process does not log to the Horizon debug log; it is most likely a monitoring or port-check agent or a scheduled script.
+* The remaining 18 stuck connections come from internal end-user devices.
+* After 13:47 the tunnel stopped accepting. 50 more connections sit un-accepted in the Windows listen backlog.
+* 57 sockets are in **CLOSE_WAIT**. These are clients that gave up waiting (including the admin's own `https://localhost/admin` attempts) while the tunnel never closed its side.
+
+**Workaround (no code change):** add a JVM option to ws_TunnelService that limits how long a TLS handshake may take (`-Dorg.bouncycastle.jsse.handshakeTimeoutMillis=15000`). See section 6. **In addition**, identify the local process that connects to its own port 443 every 15 minutes and stop it or correct it (section 6.2). That alone removes about 40% of the leak on this node.
+**Permanent fix:** a code change in the `simple.http` connector (section 5). **It is not in 2609 or `main`** (section 4.3). Upgrading to 2609 / PR #8805 will **not** fix this.
+
+---
+
+## 2. Log evidence (what actually happened)
+
+### 2.1 Timeline: PID 0x192C (fresh start → failure)
+
+| Time (−04:00) | Event | Log line (abridged) |
+|---|---|---|
+| 10:36:56 | Tunnel JVM starts | `Program 'ws_TunnelService - Java Component Service 64-bit' started, version=8.19.0 build-32120531883` |
+| 10:37:03 | **Production uses `CustomConfigurator`** (SO_TIMEOUT=0) | `[JMXServer] System property: simple.http.connect.configurator=simple.http.connect.CustomConfigurator` |
+| 10:38:44 | 443 listener created | `[bl] Listening on 0.0.0.0/0.0.0.0:443` / `SSL enabled protocols (2): [TLSv1.3, TLSv1.2]` |
+| 10:38:45 | Handshake lifetime 10 s, handshake congestion threshold 25 | `Congestion Monitor config: hsh-lifetime=10, hsh-threshold=25, ... no tar-pit ... accept-delay=200` |
+| 10:39:38 | Accept loop starts. Pool = 30 threads, queue = 30 | `[Processor] Waiting for connections on port 443 with timeout 0 ms` / `[Despatcher] Despatcher config: queue: 30, pool: 30, quash: 120s` |
+| 10:40:15 → 10:46:56 | **Exactly 5** overrun cancellations, from the **5 terminator threads** (`pool-4-thread-1..5`). **Never logged again** for the next 3 h | `<pool-4-thread-1> [PooledProcessor] Overrunning connection processor for /22.1.39.159, port:52185 cancelled after 20 seconds` … `<pool-4-thread-5> … /22.1.11.95 … cancelled after 12 seconds` |
+| 10:39 → 13:40 | Handshake threads `pool-3-thread-N` go silent **permanently**, one by one (table 2.2) | — |
+| 13:46:23 | 25 handshakes queued → congestion | `[CongestionMonitor] Connection processor queues are congested` / `handshakes=25, threshold=25, hsh-congestion=true` |
+| **13:47:10.633** | **Last accept on 443, ever** | `[Processor] Accepted connection on port 443 from /22.1.11.95, port:55090` |
+| 13:47:10.634 | Pool + queue full. Accept thread enters the retry loop | `<HTTPS Connection Processor> [PooledProcessor] Connection processor pool full - new connections may not be handled quickly` |
+| 13:47 → 14:00 | No accepts. **System CPU 2% → 28–32% sustained** (accept thread busy-spinning) | `[ws_perfmon] System CPU use: 28%` … |
+
+### 2.2 Same pattern in the previous process (PID 0x2674)
+
+| Time | Event |
+|---|---|
+| 10:16:37 | `Connection processor queues are congested` / `handshakes=25` |
+| **10:16:50.309** | **Last accept** on 443 (`/192.168.1.13:51964`) |
+| 10:16:50.309 | `Connection processor pool full - new connections may not be handled quickly` |
+| 10:16:52 → 10:34 | CPU 2% → **27–33%** sustained. No accepts at all |
+| 10:34:54 | Service stopped by admin (NSSM/`VMBlastSG` stop events are part of this restart: `StopService ok for dependent 'VMBlastSG'`) |
+
+In PID 0x2674, only 20 of the 30 `pool-3-thread-N` names log anything between 09:21 and 10:16. Threads 1, 8, 9, 10, 14, 19, 21, 26, 29 and 30 never appear, so they were most likely stuck before the log window began. No `pool-4` (terminator) lines appear either, which fits the 5 terminators having been stuck since before 09:21.
+
+### 2.3 Handshake threads that never come back (PID 0x192C)
+
+"Last seen" is each thread's final log line. The peer column is the **last accept before** that line. **This peer column is superseded by the netstat correlation in section 2.5**, which identifies the stuck connections exactly. A blocked thread logs nothing, so its last log line belongs to the *previous* task, not the one it is stuck on.
+
+| Thread | Last seen | Approx. peer | Thread | Last seen | Approx. peer |
+|---|---|---|---|---|---|
+| T4 | 10:39:38 | 22.8.33.154 | T26 | 12:01:58 | 22.1.39.181 |
+| T16 | 10:39:39 | 22.22.100.54 | T3 | 12:13:14 | 22.24.0.69 |
+| T21 | 10:39:55 | 22.1.39.159 | T13 | 12:14:04 | 22.24.0.69 |
+| T25 | 10:40:15 | 22.24.0.34 | T23 | 12:22:27 | 22.1.26.156 |
+| T11 | 10:41:19 | 22.1.16.146 | T19 | 12:41:53 | 22.1.39.144 |
+| T18 | 10:51:35 | 22.1.83.142 | T30 | 12:48:08 | 192.168.12.127 |
+| T2 | 10:56:01 | 22.1.35.134 | T6 | 12:48:22 | 22.1.83.142 |
+| T9 | 10:57:57 | 22.22.100.50 | T17 | 13:14:52 | 22.24.1.141 |
+| T8 | 11:04:18 | 22.1.24.140 | T10 | 13:15:19 | 22.22.100.42 |
+| T29 | 11:10:16 | 22.1.39.159 | T5 | 13:23:10 | 22.22.100.71 |
+| T28 | 11:19:49 | 22.1.55.135 | T15 | 13:27:03 | 22.8.33.153 |
+| T12 | 11:28:17 | 22.1.39.181 | T1 | 13:28:02 | 22.24.1.141 |
+| T14 | 11:38:16 | 22.11.39.136 | T27 | 13:35:18 | 22.1.55.135 |
+| T22 | 11:58:18 | 192.168.12.140 | T24 | 13:36:42 | 22.11.39.135 |
+| | | | T7 | 13:40:48 | 22.1.18.137 |
+
+(`pool-3-thread-20` never logged at all.) Most threads' last line is `[KeyVaultKeyManager]/[KeyVaultBinaryUtils] Removing root certificate from chain`. That is server certificate selection, the last step before the server sends its handshake flight and **waits for the client**. The log shows no KeyVault signing operation that could hang: the only operations are `getCertificateChain` (3,497 times), `getCertificateKey` and similar, all with `ok=1`. So once key selection is done, the thread can only be waiting on the client's socket.
+
+### 2.4 Noise, not the cause
+
+* **`handshake_failure(40)`**: 38 occurrences across many internal clients. In each one BC logs `raised fatal(2) handshake_failure(40) alert: Failed to read record`. These fail **quickly**, and `PooledProcessor.run()` closes the socket. They don't consume threads. `22.1.16.146` (`1ZM2VC4.daysup.com`) appears once (10:41:06) and is a desktop, not a monitoring probe.
+* **`certificate_unknown(46)` from 127.0.0.1** (7×): a local browser or client that doesn't trust the certificate. Harmless.
+* **`internal_error(80) "Failed to read record"` in `PollerInputStream.peek`**: not present in these two log files. That path is covered in section 3.3 and does not leak.
+* **NSSM 1026/1029/1018 for `VMBlastSG`**: these coincide with the manual restart at 10:34. They are not in the 443 code path.
+* **No** `Connection Processor is exiting`, `Problem with HTTP listener`, OOM, or `Cache expired and no background update available` lines.
+
+### 2.5 netstat evidence (`netstat-an.txt`, captured ≈14:07, during the outage)
+
+The CS IP is **22.1.11.95**. `netstat -an` has no PIDs, but the overrun log lines show `/22.1.11.95` as a peer, so this is the same node. All :443 sockets belong to tunnel PID 0x192C, which ran from 10:36 onwards. Each `22.1.11.95:443 ↔ peer` socket was matched against the tunnel's `Accepted connection on port 443 from /<ip>, port:<port>` lines.
+
+**Port 443 summary:** `0.0.0.0:443 LISTENING` is **still present**. The listener was never closed, which rules out H3.
+
+| Socket state on :443 | Accepted by tunnel (in log) | Never accepted (still in OS listen backlog) | Total |
+|---|---|---|---|
+| ESTABLISHED | **37** | 11 | 48 |
+| CLOSE_WAIT | **18** | 39 | 57 |
+| **Total** | **55** | **50** | 105 |
+
+#### 2.5.1 The 30 stuck worker threads, identified exactly
+
+There are **exactly 30** ESTABLISHED sockets that the tunnel accepted between 10:39:54 and 13:41:08 and that are **still open at 14:07**, hours later. This is one per pool thread, and it matches the 30 `pool-3` threads that went silent.
+
+| Accepted | Peer | Note |
+|---|---|---|
+| 10:39:54 | 22.1.39.159:52185 | `Overrunning … cancelled` at 10:40:15 (`pool-4-thread-1`), **still ESTABLISHED** |
+| 10:40:56 | 192.168.1.25:55471 | cancelled at 10:41:06 (`pool-4-thread-2`), **still ESTABLISHED** |
+| 10:43:30 | 22.11.39.144:52238 | cancelled at 10:43:51 (`pool-4-thread-3`), **still ESTABLISHED** |
+| 10:45:56 | 22.1.39.149:59009 | cancelled at 10:46:14 (`pool-4-thread-4`), **still ESTABLISHED** |
+| 10:46:44 | **22.1.11.95:50588 (self)** | cancelled at 10:46:56 (`pool-4-thread-5`), **still ESTABLISHED** |
+| 10:49:54 | 22.1.37.135:59693 | |
+| 10:54:31 | 22.11.39.143:50277 | |
+| 11:00:59 | 192.168.1.4:64351 | |
+| **11:01:44** | **22.1.11.95:50967 (self)** | |
+| 11:10:39 | 22.1.18.137:64434 | |
+| **11:16:44** | **22.1.11.95:51317 (self)** | |
+| 11:25:43 | 22.22.100.37:51380 | |
+| **11:31:44** | **22.1.11.95:51870 (self)** | |
+| **11:46:44** | **22.1.11.95:52188 (self)** | |
+| **12:01:44** | **22.1.11.95:52543 (self)** | |
+| 12:06:56 | 22.1.36.134:54557 | |
+| **12:16:44** | **22.1.11.95:52894 (self)** | |
+| 12:19:29 | 192.168.1.43:61111 | |
+| **12:31:44** | **22.1.11.95:53264 (self)** | |
+| **12:46:44** | **22.1.11.95:53606 (self)** | |
+| **13:01:44** | **22.1.11.95:53971 (self)** | |
+| 13:03:34 | 22.11.39.137:51093 | |
+| 13:16:14 | 22.22.100.6:64206 | |
+| **13:16:44** | **22.1.11.95:54343 (self)** | |
+| 13:27:02 | 22.8.33.153:63070 | |
+| 13:30:59 | 22.11.39.135:62261 | |
+| **13:31:44** | **22.1.11.95:54714 (self)** | |
+| 13:36:41 | 22.11.39.135:53562 | |
+| 13:37:48 | 22.11.39.135:53615 | |
+| 13:41:08 | 22.11.39.135:53708 | 30th stuck thread |
+
+What this proves:
+
+1. **The cancellation and close never worked.** All 5 connections that the terminator "cancelled" (10:40–10:46) are **still ESTABLISHED 3.5 h later**. `PooledProcessor.cancelledExecution()` → `ensureSockClosed()` → `sock.close()` (`PooledProcessor.java:148, 196`) never completed: it is blocked on the BC socket monitor held by `startHandshake()`, as described in section 3.2. This confirms H1 directly from the operating system's view.
+2. **The client side of each stuck connection also stays open.** For the self-connections both ends are visible: `22.1.11.95:50588 → 22.1.11.95:443 ESTABLISHED` and `22.1.11.95:443 → 22.1.11.95:50588 ESTABLISHED`. The client process is still holding its socket. These are not half-open connections from a crashed or sleeping device. The client deliberately keeps the TCP connection open and sends nothing.
+
+#### 2.5.2 The 15-minute self-connector (the periodic trigger)
+
+* The CS connects **from its own IP to its own port 443** every 15 minutes, at the same second offset: **xx:01:44, xx:16:44, xx:31:44, xx:46:44**. Log evidence:
+  * PID 0x2674: 09:31:44, 09:46:44, 10:01:44, 10:16:44.
+  * PID 0x192C: 10:46:44, then every 15 minutes through 13:46:44.
+  * The schedule carries straight across the service restart, so the client **is not part of ws_TunnelService**.
+* **It never sends a ClientHello.** After each of these accepts there is no `KeyVaultKeyManager` / `Removing root certificate from chain` / `BCJSSE-HandshakeCompleted` activity for that connection. Checked at 10:46:44, 11:46:44 and 13:16:44; the next pool-3 activity always belongs to a different peer. So the pool thread blocks in `TlsServerProtocol.accept` waiting for the very first record, and with SO_TIMEOUT 0 that wait never ends.
+* **It doesn't log anything in any Horizon component** at those times: no broker (1E40/2218), tunnel or perfmon line other than the accept. `SGHealth` (`broker/.../health/SGHealth.java:794-842`) runs about every minute over JMS and is not it. No 15-minute HTTPS self-call was found in broker, tunnel, common or rest code. **It is most likely a third-party monitoring or port-check agent or a scheduled script on the CS** that does a TCP connect to `<FQDN>:443` (the FQDN resolves to 22.1.11.95, hence the hairpin) and leaks the socket. Identify it with the commands in section 6.2.
+* **Impact:** **12 of the 30 stuck threads (40%)** on this node come from this one source. On its own it exhausts the 30-thread pool in **7.5 hours**. Combined with end-user devices it did so in about 3 hours here. This is also very likely the "periodic ~15 min" pattern R&D observed.
+
+#### 2.5.3 Other stuck peers
+
+The other 18 stuck connections come from internal end-user subnets: 22.1.x, 22.11.39.x, 22.22.100.x, 22.8.33.x and 192.168.1.x. `22.11.39.135` alone holds 9 ESTABLISHED and 5 CLOSE_WAIT sockets (it does `POST /broker/xml`, i.e. a Horizon Client). No UAG or load-balancer addresses appear.
+
+#### 2.5.4 CLOSE_WAIT (57) explained: the tunnel never closes queued sockets
+
+* **18 accepted + CLOSE_WAIT** (accepted 13:41:09 → 13:47:10). These were waiting in the despatch queue (`ArrayBlockingQueue(30)`, `Despatcher.java:81`) for a free thread that never came. The client gave up and sent FIN, but no thread ever touched the socket, so the server side sits in CLOSE_WAIT. It includes **6 × `127.0.0.1` (13:45:57–13:46:02)**: the admin trying `https://localhost/admin` on the server. Their client side is `FIN_WAIT_2`. This matches the log's `handshakes=25` at 13:46:23 and `pool full` at 13:47:10.
+* **39 not accepted + CLOSE_WAIT** (plus 11 ESTABLISHED) are in the **OS listen backlog**. The kernel completed the TCP handshake, but the accept thread has been spinning in `MonitoredPool.despatch` since 13:47:10 and never called `accept()` again. Most of them (29) are from **22.22.100.129, an admin workstation whose Admin console dashboard polls `/rest/monitor/v2/system-metrics`, `/rest/monitor/v1/sessions/metrics` and `/rest/monitor/v1/health-metrics`**. Its browser kept retrying. At 13:54 it fell back to **port 80** (`Accepted connection on port 80 from /22.22.100.129`).
+* **This CLOSE_WAIT is a symptom, not the cause.** It is not the `PollerInputStream`/`BasicPoller` leak suspected in R&D's hypothesis (H4). Those sockets were never handshaked or polled.
+
+#### 2.5.5 What the browser sees
+
+`socketBacklog` = **200** (`NetHandler.java:160-169`, logged `Socket back log has been configured with a value of 200`), passed to `ss.bind(socketAddress, backlog)` (`NetUtil.java:589`). At 14:07 the backlog held 50 entries.
+
+* While the backlog has room, Windows completes the TCP handshake, but the tunnel never answers the ClientHello. Browsers then show a timeout or a closed connection.
+* Once the backlog is full, or Windows' SYN-backlog protection triggers, new SYNs get a RST, which the browser reports as **ERR_CONNECTION_REFUSED**.
+* Which of the two a user sees depends on how long the outage has lasted and on how many clients are retrying. **The root cause is the same in both cases: the accept thread is no longer calling `accept()`.**
+
+---
+
+## 3. Code analysis (release/2606)
+
+### 3.1 The 443 listener and accept loop
+
+| Step | Code |
+|---|---|
+| Listen backlog = `socketBacklog` (locked.properties), default **200** | `tunnel/tunnel-server/src/main/java/com/omnissa/vdi/ice/server/NetHandler.java:160-169` |
+| SSL server socket for 443 created (BC JSSE `ProvSSLServerSocket`) | `NetHandler.java:239-243` (`NetUtil.makeSSLListener(...)`) |
+| Front wires the simple.http connector and congestion monitor | `tunnel/.../front/Front.java:2259-2290` (`handshakeLifetime` default 10 s: `Front.java:491, 2670-2690`) |
+| `connection.connect(serverSocket)` → `new Processor(...)` (thread "HTTPS Connection Processor") | `Front.java:2373`, `thirdparty/simple-3.1.3/src/simple/http/connect/Connection.java:113-117` |
+| Accept loop | `simple/http/connect/Processor.java:155-182` (`run`) and `198-316` (`execute`) |
+| `sock = server.accept()` | `Processor.java:210` |
+| SSL sockets handed to the pool | `Processor.java:281-289` → `Despatcher.getInstance().despatch(...)` |
+| Rate-limit sleep (200 ms) when congested | `Processor.java:312-314` |
+
+**What the accept loop does on failure:**
+
+* `run()` catches **every `Throwable`** from `execute()`, logs `Problem with HTTP listener`, and loops (`Processor.java:158-181`). An OOM/`Error` doesn't kill the thread.
+* It **exits** only if `server.isClosed()` (`:164-166`) or the throwable is an `SSLException` (`:168-179`). In that case it logs **FATAL** `Connection Processor is exiting`, **closes the server socket**, and returns. The process stays up and 443 is then really closed, which would also cause ERR_CONNECTION_REFUSED. **Neither message is in the logs**, so this path did not happen here (H3).
+* **Full or rejected executor:** this is what happened. `Despatcher.despatch()` is `synchronized` (`pool/Despatcher.java:125`) and calls `MonitoredPool.despatch()`, which loops **`while (status == null)`** on `RejectedExecutionException` with **no sleep, back-off or give-up** (`pool/MonitoredPool.java:251-347`, catch at `:255-281`). Until a pool slot frees up, the accept thread never returns to `server.accept()`. It is not *dead*, it is **spinning**, which explains the sustained ~30% CPU. The only log line is the rate-limited `Connection processor pool full` (`PooledProcessor.java:121-131`, quash 120 s).
+
+### 3.2 `PooledProcessor.run()` / `handshake()` (questions in item 2)
+
+| Question | Answer with code |
+|---|---|
+| Pool size / queue / handler | `THREADS = 30`, `TASKS = 30` (`Despatcher.java:45-50`). Can be overridden with `-Dsimple.http.connect.pool.poolsize` / `.queuesize` (`:73-78`). Queue is `ArrayBlockingQueue(30, fair)` (`:81-82`). `MonitoredPool` uses core = max = 30 because keepAlive = 0 (`MonitoredPool.java:99-100`). Default `ThreadPoolExecutor.AbortPolicy` → `RejectedExecutionException` → retried forever (`MonitoredPool.java:251-281`). Threads use the default factory, so they are named `pool-3-thread-N`. |
+| Handshake / read timeout? | **None.** `run()` calls `configure(sock)` and then `handshake(sock)` (`PooledProcessor.java:178-191`). The configurator in production is `CustomConfigurator` (log line at 10:37:03; selected via `ConfiguratorFactory.java:53-63`). It does **`s.setSoTimeout(0)`** and **`s.setKeepAlive(false)`** (`CustomConfigurator.java:54-56, 88-93`). `secure.startHandshake()` (`PooledProcessor.java:244`) therefore blocks **with no time limit**. BouncyCastle 1.85's own handshake timeout, `org.bouncycastle.jsse.handshakeTimeoutMillis`, defaults to **0 = disabled** (bctls-jdk18on-1.85 `ContextData.<init>`: `getIntegerSystemProperty("org.bouncycastle.jsse.handshakeTimeoutMillis", 0, 0, MAX)`). It is not set (not in the logged system properties). (`DefaultConfigurator` would set 60 s, `DefaultConfigurator.java:41-44`, but HZN-929 deliberately replaced it, commit `f12444044f`.) |
+| Can the "handshake lifetime" (10 s) rescue the thread? | **No.** The watch list is only checked when a new connection is despatched (`MonitoredPool.java:315-346`). For an overdue task, `Monitor.terminate()` queues work on `terminatorPool` (`MonitoredPool.java:201-221`). That work calls `status.cancel(true)`, which is only `Thread.interrupt()` and **does not unblock a blocking socket read** on a platform thread. It then calls `PooledProcessor.cancelledExecution()` → `ensureSockClosed()` → `sock.close()` (`PooledProcessor.java:138-149, 193-200`). In BC JSSE, **`ProvSSLSocketDirect.startHandshake()` and `ProvSSLSocketDirect.close()` are both `synchronized`** on the socket (verified with `javap` on bctls-jdk18on 1.81, 1.83, 1.85 and 1.86.1). The handshaking thread holds that monitor while it blocks in the read, so **`close()` blocks forever too**. |
+| Terminator pool | `Executors.newFixedThreadPool(5)` with an unbounded queue (`Despatcher.java:88-89`, added by HZN-5102 commit `5d6677b7d6`). After 5 blocked `close()` calls, **all 5 terminators are stuck** and later terminate requests just queue up. This is exactly what the logs show: 5 `pool-4-thread-1..5` "Overrunning … cancelled" lines and then nothing. The monitor entry is also removed (`delete(task)`, `MonitoredPool.java:343`), so the thread is never looked at again. |
+| Queued (not yet started) tasks | Never treated as overdue (`Monitor.isOverdue()` returns `false` while `runUntil == 0`, `MonitoredPool.java:168-175`). They wait for a free thread indefinitely. |
+| Socket always closed after failure? | **Only for `Exception`.** `run()` catches `Exception` and calls `ensureSockClosed()` (`PooledProcessor.java:182-190`). There is no `finally`. An `Error` (OOM, `StackOverflowError`, `NoClassDefFoundError`) skips the close. Tasks are submitted via `submit()` (`MonitoredPool.java:254`), so `FutureTask` captures the throwable and `afterExecute(r, t)` receives `t == null`. **`interruptedExecution()` (`MonitoredPool.java:417-424`, `PooledProcessor.java:155-169`) is effectively unreachable**, and in that case the socket leaks (CLOSE_WAIT once the peer closes). Not observed here, but it is a real gap. |
+| Why do the peers never close? | If the peer sent FIN or RST, BC's read would return EOF or an error, the handshake would fail and the thread would be freed (this is the 38 `Failed to read record` cases). A thread stays stuck only when **nothing arrives**: a sleeping or roaming device, a VPN/Wi-Fi drop, or a firewall/NAT idle-timeout that silently drops state. `CustomConfigurator` disables TCP keepalive (`CustomConfigurator.java:55, 92`), so such half-open sockets are **never** detected. These sockets show as **ESTABLISHED** (not CLOSE_WAIT) in `netstat`. |
+
+### 3.3 `PollerInputStream.available()` → `peek()` and `BasicPoller.process()` (item 3)
+
+* `BasicPoller.process()` calls `data.available()` (`BasicPoller.java:90-92`). `PollerInputStream.available()` → `available(1)` → `peek(1)` (`PollerInputStream.java:189-191, 209-214`).
+* `peek(int)` sets **SO_TIMEOUT = 1 ms**, performs a real `data.read(...)` on the BC `AppDataInput`, then restores the old timeout (`PollerInputStream.java:263-275`, read at `:234`). `InterruptedIOException` (timeout) is swallowed (`:242-243`). So `available()` **does** do a read on the TLS socket, but it is bounded to about 1 ms. It does **not** block a poller thread indefinitely, and it runs only after the handshake, when the BC socket monitor is no longer held.
+* On `SocketException` (your trace #2, "An established connection was aborted…", raised by BC as `internal_error(80) Failed to read record`), the exception propagates out of `peek()`. The restore at `:272` is skipped (minor defect, harmless here). It reaches `simple.http.Processor.execute()`, which catches **`Throwable`** and calls **`poller.close()`** (`simple/http/Processor.java:94-107`) → `Pipeline.close()` → `sock.close()` (`Pipeline.java:243-249`). The poller worker loop also catches `Throwable` and continues (`simple/http/Processor.java:60-68`). **No socket or thread leak on this path.** Idle pipelines are closed by `FastGranularPoller.wait()` (`FastGranularPoller.java:160-191`).
+* **Conclusion:** this path is **not** the cause (H4).
+
+---
+
+## 4. Ranked root-cause hypotheses
+
+| # | Hypothesis | Confidence | Evidence |
+|---|---|---|---|
+| **H1** | **The handshake pool is permanently exhausted by TLS handshakes that never finish.** No handshake read timeout (`CustomConfigurator.java:91`, BC `handshakeTimeoutMillis` = 0). Cancellation can't unblock the thread: `cancel(true)` only interrupts, and `close()` is blocked by the BC monitor. The 5 terminator threads deadlock as well. With 30 threads stuck and 30 tasks queued, the accept thread busy-spins in `MonitoredPool.despatch()` (`:251-347`) and stops calling `accept()`. The backlog (200) fills and Windows refuses new SYNs, which the browser shows as **ERR_CONNECTION_REFUSED**. Port 443 still shows LISTENING and the service stays *Running*. | **High (~95%)** | Sections 2.1–2.3: exactly 5 terminator log lines then silence; threads disappear one by one; `handshakes=25` congestion; last accept within 1 ms of `pool full` in **both** processes; CPU jumps to ~30% at that exact moment; locking confirmed in the BC bytecode. **netstat (2.5.1):** exactly 30 accepted sockets still ESTABLISHED hours later, including all 5 "cancelled" ones, while `0.0.0.0:443 LISTENING` is still present and 50 connections sit un-accepted in the backlog. |
+| H2 | **Trigger: clients that open TCP 443 and then stay silent.** **(a) A local process on the CS (22.1.11.95) connects to its own :443 every 15 min (xx:01:44/16:44/31:44/46:44) and never sends a ClientHello or closes the socket. It accounts for 12 of the 30 stuck threads.** (b) Internal end-user devices supply the other 18. This explains "internal only": internal CS nodes accept direct TLS from many end-user devices, and only internal nodes run that local monitoring. External CS nodes behind UAG only see UAG, which completes or closes handshakes. TCP keepalive is disabled (`CustomConfigurator.java:92`), so silent peers are never reaped. | **High (a)** / Medium-High (b) | netstat 2.5.1–2.5.3: both ends of every self-connection are ESTABLISHED; the log shows no handshake activity after those accepts; there are no UAG/LB addresses among the stuck peers. |
+| H3 | The accept loop exits on `SSLException` and closes 443 (`Processor.java:168-179`). | **Ruled out** | No `Connection Processor is exiting` / `Problem with HTTP listener` in either log. netstat still shows `0.0.0.0:443 LISTENING` during the outage. |
+| H4 | CLOSE_WAIT or thread leak in `PollerInputStream`/`BasicPoller` (trace #2). | Low | Section 3.3: every `Throwable` closes the pipeline. Reads are bounded to 1 ms. The 57 CLOSE_WAIT sockets in netstat are all **queued or never-accepted** sockets (2.5.4), not polled pipelines. |
+| H5 | Periodic `handshake_failure(40)` probes (~15 min) cause the exhaustion. | Low (noise) | They fail fast and are closed in `PooledProcessor.run()` (`:182-190`). They come from the same client population that also produces stalled handshakes. |
+| H6 | A 2606-specific code regression in this path. | **Not proven** | See 4.2. The vulnerable code is the same in 2512/2603/2606. |
+
+### 4.1 Item 6: anything periodic (~15 min) in ws_TunnelService?
+
+`scheduleAtFixedRate|scheduleWithFixedDelay|new Timer|.schedule(` in `tunnel/` and `simple/` (release/2606) only finds:
+
+* `AjpFaviconHealthCheck` (`tunnel/.../front/AjpFaviconHealthCheck.java:116,121`). It polls **Tomcat over AJP**, not 443, every 60 s (50 s in 2609, HZN-11491).
+* The `AJPConnectionPoolMonitor` sleep of 120 s (`Front.java:2325-2335`).
+* Session kill timers (`ServerSession.java:613`, `SessionHandler.java:168`).
+* A one-shot timer in `Ice.java:1848-1856`.
+
+Nothing **inside ws_TunnelService** on a 15-minute cycle reloads, restarts or touches the 443 listener, its keystore or the handshake pool. The congestion watch list only runs on accept.
+
+**However, the netstat and logs show a 15-minute trigger from *outside* the tunnel (section 2.5.2):**
+
+* A process on the CS itself connects to `22.1.11.95:443` every 15 minutes (xx:01:44, xx:16:44, xx:31:44, xx:46:44).
+* The schedule continues across the tunnel restart.
+* It never sends a ClientHello and never closes, so each attempt permanently takes one of the 30 worker threads.
+
+Broker `SGHealth` (`SGHealth.java:794-842`, about every minute, over JMS) and `MemoryHealthMonitor` (`SLEEP_TIME = 15 * 60 * 1000`, `MemoryHealthMonitor.java:38`, in-process memory check) do not make HTTPS calls to 443. No Horizon code was found that does this, so the process must be identified on the server (section 6.2).
+
+How fast the pool runs out depends on how many silent clients there are. On this node: 12 of the stuck threads came from the self-connector and 18 from end-user devices, and exhaustion took about 3 h 10 min (10:36 → 13:47). On nodes with more silent clients it can be 10–15 minutes, as reported.
+
+### 4.2 Item 4: what changed in 2606 vs earlier releases
+
+| Area | 2512 | 2603 | **2606** | 2609 | Source |
+|---|---|---|---|---|---|
+| `bctls-jdk18on` | 1.81 | 1.83 | **1.85** | 1.86.1 | `vdi/pom.xml` `<bctls.version>` at each tag |
+| `bcprov-jdk18on` | 1.81 | 1.83 | **1.85.2** | 1.86 | same |
+| JDK | 17 | 17 | **21** (`4ac62918be` DPM-16945, not in v2603) | 21 | git |
+| BC `startHandshake()`/`close()` both `synchronized` | yes | yes | yes | yes | `javap` on each jar |
+| BC handshake timeout support | absent | absent | present, **default 0 (off)** | present, default 0 | `ContextData`/`HandshakeTimeoutInputStream` in 1.85+ |
+| Terminator pool (5 threads) | yes | yes | yes | yes | `5d6677b7d6` (HZN-5102, 2025-06) |
+| `CustomConfigurator` (SO_TIMEOUT 0) | yes | yes | yes | yes | `f12444044f` (HZN-929, 2024-01) |
+| `PooledProcessor` / `MonitoredPool` / `Despatcher` / `connect.Processor` | — | — | **revocation-only changes** (`f0cea17ddb` reverted by `75ed2e5e81`, `0c3917c131`) | revocation per-listener (`3dafe19773`) | `git log v2603..v2606` / `v2606..v2609` |
+| `PollerInputStream` / `BasicPoller` / `http.Processor` | unchanged since 2024 / 2018 | | unchanged | unchanged | `7fbbb87d9d` (HZN-2383), `7457d15375`, `6c63b363ed` |
+| Tunnel TLS parameters | | | `minimumRsaKeyLength` / `selfSignedCertRsaKeyLength` (`Ice.java`), CRL signature-scheme restriction (`NetHandler.java`), NIAP SHA-384 defaults (`184254022d`) | | `git diff v2603 v2606 -- vdi/tunnel` |
+
+**Conclusion:** the flaw (no handshake timeout, a close that can't interrupt a blocked handshake, and an accept loop that retries forever) has existed **since HZN-5102 (2025-06) in 2512, 2603 and 2606**. I found **no 2606 code change in this path**. The 2606 deltas that could raise the *rate* of stalled handshakes are BC 1.83 → 1.85, JDK 17 → 21, and the NIAP/SHA-384 and signature-scheme changes. None of them is proven by code to cause stalls. R&D should run the repro in section 8 on 2603 and 2606 to measure the difference.
+
+### 4.3 Item 5: PR #8805 (HZN-10810)
+
+* Commit `dcf73f952e` "Prevent broker startup failure when SAML IdP metadata TLS/CRL check fails (#8805)". It is on `release/2609` and `main` and **not in `v2606`**.
+* It changes only `broker/.../filters/ServerConfigurationFilter.java` (wraps `SamlCache.populateSamlConfiguration()` in try/catch), `common/saml/.../SamlLdapUtil.java` and `common/saml/.../SamlUtil.java`. It stops a SAML metadata `SSLHandshakeException` from aborting **broker (Tomcat) startup**.
+* **It does not touch ws_TunnelService, `simple.http`, port 443, handshake timeouts or the thread pools.** That failure mode would show as a broker that never starts (5xx from AJP), not ERR_CONNECTION_REFUSED with accepts stopping. **It does not cover this code path.**
+* `v2606..v2609` and `v2606..origin/main` contain no change to `PooledProcessor` (except 2 revocation lines), `MonitoredPool`, `Despatcher`, `connect/Processor` or `CustomConfigurator`. `org.bouncycastle.jsse.handshakeTimeoutMillis` is not set anywhere on `main`. **Upgrading to 2609 will not fix this. A code fix (section 5) is needed for both 2606 (hotfix) and 2609/main.**
+
+---
+
+## 5. Code fix (proposed diffs)
+
+The fixes are independent. **5.1 and 5.2 are required.** 5.3–5.5 are hardening.
+
+### 5.1 Bound the TLS handshake and always close on failure: `PooledProcessor.java`
+
+```diff
+--- a/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/PooledProcessor.java
++++ b/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/PooledProcessor.java
+@@ -9,6 +9,7 @@ package simple.http.connect.pool;
+ import java.io.IOException;
+ import java.math.BigInteger;
+ import java.net.Socket;
++import java.net.SocketException;
+ import java.security.cert.X509Certificate;
+@@ -71,6 +72,22 @@ public final class PooledProcessor
+     /**
+      * True if a warning has already been output by rejectedExecution.
+      */
+     private boolean rejectionNotified = false;
+ 
++    /**
++     * Upper bound for a TLS handshake. CustomConfigurator sets SO_TIMEOUT=0
++     * (HZN-929) and BC JSSE holds the socket monitor for the whole of
++     * startHandshake(), so without this a silent peer pins a pool thread
++     * forever and close() from the terminator blocks as well (AST-33916).
++     * 0 disables.
++     */
++    private static final int HANDSHAKE_TIMEOUT_MS = Integer.getInteger(
++            "simple.http.connect.pool.handshakeTimeoutMillis", 15000);
++
++    /**
++     * SO_TIMEOUT set by the Configurator; restored once the handshake is done.
++     */
++    private volatile int postHandshakeSoTimeout = 0;
++
+@@ -177,17 +194,28 @@ public final class PooledProcessor
+     @Override
+     public void run() {
++        boolean handedOff = false;
+         try {
+             configure(sock);
+             handshake(sock); // calls process() on completion
++            handedOff = true;
+         } catch (Exception e) {
+             LogUtil.reportException(e, sock, log);
+-
+-            ensureSockClosed();
+-
+             if (e instanceof IOException) {
+                 notifier.notifyDropped(sock.getInetAddress());
+             }
++        } catch (Error e) {
++            // submit() wraps us in a FutureTask, so afterExecute() never sees
++            // this; log it here and make sure the socket is not leaked.
++            log.error("Connection processor failed for "
++                    + LogUtil.displayableRemoteSocketAddress(sock), e);
++            throw e;
++        } finally {
++            if (!handedOff) {
++                ensureSockClosed();
++            }
+         }
+     }
+@@ -235,6 +263,11 @@ public final class PooledProcessor
+         if (secure != null) {
+             if (cp.isUseCertAuth()) {
+                 secure.setWantClientAuth(true);
+ 
+             }
++            postHandshakeSoTimeout = secure.getSoTimeout();
++            if (HANDSHAKE_TIMEOUT_MS > 0) {
++                // SocketTimeoutException -> handshake fails -> run() closes sock
++                secure.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
++            }
+             secure.addHandshakeCompletedListener(this);
+@@ -358,6 +391,15 @@ public final class PooledProcessor
+             log.debug("Peer unverified");
+         }
+ 
++        // Restore the Configurator's SO_TIMEOUT before the pipeline starts
++        // reading (runs on the BCJSSE-HandshakeCompleted thread, before
++        // process()).
++        try {
++            sock.setSoTimeout(postHandshakeSoTimeout);
++        } catch (SocketException e) {
++            log.debug("Could not restore SO_TIMEOUT: {}", e.getMessage());
++        }
++
+         try {
+             process(sock, errorCode);
+         } catch (Exception e) {
+```
+
+Notes:
+
+* `setSoTimeout()` is not `synchronized` in `ProvSSLSocketDirect`. BC's own `HandshakeTimeoutInputStream` does exactly this.
+* The default of 15 s is well above the 10 s `handshakeLifetime`. Use 100 s+ if cert-auth (smart-card PIN prompts) is enabled. `HANDSHAKE_LIFETIME_CERTAUTH_DEFAULT = 100`, `Front.java:497`. Alternatively, derive the value from `monitor.getHandshakeLifetime()` when the processor is created.
+* Equivalent one-line alternative: set `System.setProperty("org.bouncycastle.jsse.handshakeTimeoutMillis", ...)` in tunnel start-up **before** the `SSLContext` is created. BC then wraps the input and restores SO_TIMEOUT itself.
+
+### 5.2 Never let the accept thread spin forever: `MonitoredPool.java` + `Despatcher.java`
+
+```diff
+--- a/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/MonitoredPool.java
++++ b/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/MonitoredPool.java
+@@ -43,6 +43,16 @@ public class MonitoredPool extends ThreadPoolExecutor {
+     private static final long MAX_DELAY = 1000;
+ 
++    /** Back-off between rejected submissions (ms). */
++    private static final long REJECT_BACKOFF_MS = Long.getLong(
++            "simple.http.connect.pool.rejectBackoffMillis", 50);
++
++    /**
++     * Give up after this many rejected submissions; the caller drops the
++     * connection so the accept loop keeps running (AST-33916).
++     */
++    private static final int MAX_REJECTED_ATTEMPTS = Integer.getInteger(
++            "simple.http.connect.pool.maxRejectedAttempts", 100);
++
+@@ -244,7 +254,8 @@ public class MonitoredPool extends ThreadPoolExecutor {
+-     * @return the number of attempts (always > 0) to queue the task
++     * @return the number of attempts (> 0) to queue the task, or a negative
++     *         value if the task could not be queued and was abandoned
+      */
+@@ -345,6 +356,20 @@ public class MonitoredPool extends ThreadPoolExecutor {
+                     }
+                 }
+             }
++
++            if (status == null) {
++                if (attempts >= MAX_REJECTED_ATTEMPTS) {
++                    log.error("Connection processor pool exhausted: active={},"
++                            + " queued={}, monitors={}; abandoning task",
++                            getActiveCount(), getQueue().size(), monitor.size());
++                    return -attempts;
++                }
++                try {
++                    Thread.sleep(REJECT_BACKOFF_MS);
++                } catch (InterruptedException ie) {
++                    Thread.currentThread().interrupt();
++                    return -attempts;
++                }
++            }
+         }
+ 
+         return attempts;
+```
+
+```diff
+--- a/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/Despatcher.java
++++ b/vdi/thirdparty/simple-3.1.3/src/simple/http/connect/pool/Despatcher.java
+@@ -7,9 +7,11 @@ package simple.http.connect.pool;
+ 
++import java.io.IOException;
+ import java.net.Socket;
+ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.concurrent.atomic.AtomicInteger;
+@@ -86,8 +88,15 @@ public class Despatcher {
+-        // create the thread pool for closing overdueMoniteredPoll tasks
+-        terminatorPool = Executors.newFixedThreadPool(5);
++        // create the thread pool for closing overdue MonitoredPool tasks
++        // (named so it is identifiable in thread dumps)
++        AtomicInteger seq = new AtomicInteger();
++        terminatorPool = Executors.newFixedThreadPool(5, r -> {
++            Thread t = new Thread(r, "HandshakeTerminator-" + seq.incrementAndGet());
++            t.setDaemon(true);
++            return t;
++        });
+@@ -137,6 +146,19 @@ public class Despatcher {
+         int attempts = pool.despatch(processor, processor, lifetime);
+ 
++        if (attempts < 0) {
++            // pool exhausted: drop this connection but keep accepting
++            log.error("Dropping connection from "
++                    + LogUtil.displayableRemoteSocketAddress(sock)
++                    + ": connection processor pool exhausted");
++            try {
++                sock.close(); // not yet handshaking: no BC monitor contention
++            } catch (IOException ignore) {
++            }
++            notifier.notifyDropped(sock.getInetAddress());
++            notifier.updateHandshakeQueueCount(queue.size());
++            return;
++        }
++
+         // typically called inside a loop so don't clutter the debug log
+```
+
+(Optional: also name the main pool threads, e.g. `HandshakeProcessor-N`, by passing a `ThreadFactory` into `MonitoredPool`.)
+
+### 5.3 (Hardening) Don't let a stray `SSLException` kill the listener: `connect/Processor.java:168-179`
+
+BC's `ProvSSLServerSocket.accept()` does not handshake, so an `SSLException` reaching `run()` cannot mean the *server socket* failed. Exit only when `server.isClosed()`:
+
+```diff
+-                if (e instanceof SSLException) {
+-                    /*
+-                     * These are fatal when encountered in accept().
+-                     */
+-                    log.fatal("Connection Processor is exiting");
+-                    try {
+-                        server.close();
+-                    } catch (IOException ignore) {
+-                    }
+-
+-                    break;
+-                }
++                // avoid a hot loop on a persistent error, but keep listening
++                try {
++                    Thread.sleep(100);
++                } catch (InterruptedException ie) {
++                    Thread.currentThread().interrupt();
++                    break;
++                }
+```
+
+### 5.4 (Hardening) Restore SO_TIMEOUT in `finally`: `PollerInputStream.java:263-275`
+
+```diff
+    private int peek(int timeout) throws IOException {
+       int wait = sock.getSoTimeout();
+-
+-      if(timeout > 0) {
+-         sock.setSoTimeout(timeout);
+-      }
+-      int size = peek();
+-
+-      if(size != -1) {
+-         sock.setSoTimeout(wait);
+-      }
+-      return size;
++      if(timeout > 0) {
++         sock.setSoTimeout(timeout);
++      }
++      try {
++         return peek();
++      } finally {
++         if(timeout > 0 && !sock.isClosed()) {
++            sock.setSoTimeout(wait);
++         }
++      }
+    }
+```
+
+### 5.5 Unit / integration test to add (`*Test*.java`, so Surefire picks it up)
+
+1. Start a BCJSSE `SSLServerSocket` with `Connection`/`Despatcher`, using `poolsize=2` and `queuesize=2`.
+2. Open 10 raw TCP sockets that never send a ClientHello.
+3. Assert that a real TLS client still completes a handshake within `HANDSHAKE_TIMEOUT_MS + 5 s`.
+4. Assert that all `pool-*` threads return to `ThreadPoolExecutor.getTask` and that the stalled sockets end up closed.
+
+---
+
+## 6. Customer workaround (no code change)
+
+### 6.1 Recommended: enable BouncyCastle's handshake timeout for ws_TunnelService
+
+BC 1.85 (shipped in 2606) reads the JVM system property **`org.bouncycastle.jsse.handshakeTimeoutMillis`** (bctls 1.85 `ContextData`, default `0` = off). When it is > 0, `ProvSSLSocketDirect.startHandshake(boolean)` wraps the socket input in `HandshakeTimeoutInputStream`, which applies SO_TIMEOUT for the rest of the handshake and restores the original value afterwards. A stalled handshake then throws `SocketTimeoutException`, `PooledProcessor.run()` closes the socket (`PooledProcessor.java:182-190`), and the thread is released. The terminator's `close()` also unblocks, because the monitor is released.
+
+Steps (on each affected CS, in a maintenance window):
+
+1. Open `regedit` and go to the tunnel JVM options value referenced in code (`CustomConfigurator.java:17-19`):
+   `HKLM\SOFTWARE\Omnissa\Horizon\Plugins\wsnm\TunnelService\Params` → value **`JvmOptions`**. The code comment spells it `...\wsnm\tunnelService\Params\JvmOptions`. Registry keys are case-insensitive, but confirm the exact key on the server.
+2. **Append** (do not replace; the value already contains `-Dsimple.http.connect.configurator=simple.http.connect.CustomConfigurator` and others), separated by a space:
+   ```
+   -Dorg.bouncycastle.jsse.handshakeTimeoutMillis=15000
+   ```
+   Use `120000` if smart-card / certificate authentication is enabled on this CS. PIN entry happens during the handshake; the cert-auth handshake lifetime is 100 s (`Front.java:497`).
+3. Restart the **Omnissa Horizon Connection Server** service.
+4. Verify in the debug log after restart:
+   `[JMXServer] System property: org.bouncycastle.jsse.handshakeTimeoutMillis=15000`
+5. Afterwards you should see occasional `Problem processing HTTP connection ... SocketTimeoutException` / `Read timed out` (normal, the stalled peer is dropped). You should **not** see `Overrunning connection processor`, `Connection processor pool full` or a sustained CPU rise.
+
+This property only bounds the **handshake**. After the handshake BC restores the SO_TIMEOUT that `CustomConfigurator` set, so tunnel and Blast connections are unaffected. It also bounds outbound TLS handshakes made by the tunnel JVM, and 15 s is generous for those. **Validate on a lab CS first** (repro in section 8).
+
+### 6.2 Identify and stop the 15-minute local self-connector (no code change, do this as well)
+
+On this node, 40% of the stuck threads come from a process **on the CS itself** that connects to `<FQDN>:443` every 15 minutes (xx:01:44 / xx:16:44 / xx:31:44 / xx:46:44), never sends TLS, and never closes. Its client sockets are still open at 14:07 (`22.1.11.95:50588 … 54714 → 22.1.11.95:443 ESTABLISHED`). That means the owning process is still running and holding them, so it can be identified directly.
+
+```powershell
+# Which process owns the client side of the self-connections to :443?
+Get-NetTCPConnection -RemotePort 443 -State Established |
+  Where-Object { $_.LocalAddress -eq $_.RemoteAddress -or $_.RemoteAddress -eq '127.0.0.1' } |
+  Select LocalAddress,LocalPort,RemoteAddress,CreationTime,OwningProcess,
+         @{n='Process';e={(Get-Process -Id $_.OwningProcess).Path}} |
+  Sort-Object CreationTime
+# Or: netstat -anob | findstr /C:"22.1.11.95:443"   (run as admin; -b shows the image name)
+
+# Look for scheduled tasks / monitoring agents running every 15 minutes
+Get-ScheduledTask | Where-Object { $_.Triggers.Repetition.Interval -eq 'PT15M' } |
+  Select TaskPath,TaskName,@{n='Action';e={$_.Actions.Execute + ' ' + $_.Actions.Arguments}}
+```
+
+Typical culprits: a monitoring agent's "TCP port 443" or "URL" check (SCOM, SolarWinds, PRTG, Nagios/NSClient++, Dynatrace or similar), a security or inventory scanner, or a PowerShell scheduled task that opens a `System.Net.Sockets.TcpClient` to the FQDN and never disposes it.
+
+Remediation, in order of preference:
+
+1. Make the check close its socket.
+2. Use a proper HTTPS check against `https://<FQDN>/favicon.ico` (the Horizon health endpoint).
+3. Stop the check on the Connection Servers.
+
+This must be confirmed with the customer. **Note:** even after this is fixed, end-user devices still produce silent connections (18 of 30 here), so 6.1 is still required.
+
+### 6.3 Interim / defence-in-depth (optional)
+
+| Setting | Where | Effect | Caveat |
+|---|---|---|---|
+| `-Dsimple.http.connect.pool.poolsize=150 -Dsimple.http.connect.pool.queuesize=150` | same `JvmOptions` value | More threads and slots before exhaustion (`Despatcher.java:73-82`) | Only **delays** the failure if 6.1 isn't applied. Stuck threads are still permanent. |
+| Scheduled restart of the CS service off-hours | Task Scheduler | Clears stuck threads | Stop-gap only |
+| Firewall / NAT idle timeouts between clients and internal CS | network | Fewer silently dropped TCP sessions | Doesn't fix the server |
+
+**Do not** do these:
+
+* **Change `handshakeLifetime`** (`Front.java:2674`). Cancellation can't unblock the thread, so the value doesn't matter.
+* **Change `socketBacklog`** (`NetHandler.java:162`). It only increases how many SYNs queue up before the refusal.
+* **Remove `-Dsimple.http.connect.configurator=...CustomConfigurator`.** That would bring back the 60 s TLS 1.3 close-delay congestion fixed by HZN-929 (`f12444044f`), and it would put a 60 s read timeout on every connection.
+
+---
+
+## 7. What to check in ws_TunnelService thread dumps
+
+Capture with the Horizon JRE (`jcmd <pid> Thread.print -l` or `jstack -l <pid>`) run **as SYSTEM** (e.g. `psexec -s`). Take three dumps 10 s apart. Use `<pid>` = `ws_TunnelService.exe`.
+
+| Thread | Healthy | Problem (confirms H1) |
+|---|---|---|
+| `HTTPS Connection Processor` | `RUNNABLE` in `sun.nio.ch.NioSocketImpl.accept` / `java.net.ServerSocket.implAccept` ← `org.bouncycastle.jsse.provider.ProvSSLServerSocket.accept` ← `simple.http.connect.Processor.execute(Processor.java:210)` | `RUNNABLE` in `ThreadPoolExecutor.reject` / `RejectedExecutionException.<init>` / `AbstractExecutorService.submit` / `ConcurrentHashMap$KeyIterator` ← **`simple.http.connect.pool.MonitoredPool.despatch`** ← `Despatcher.despatch` (**locked `<Despatcher>`**) ← `Processor.execute(Processor.java:287)`. The frames vary across dumps, but it is **never in `accept`**. This is also the thread burning the CPU. |
+| `pool-3-thread-1..30` (handshake pool) | Mostly `WAITING` in `ArrayBlockingQueue.take` ← `ThreadPoolExecutor.getTask` | **All 30** `RUNNABLE` (native read) in `sun.nio.ch.Net.poll`/`NioSocketImpl.park`/`NioSocketImpl.read` ← `Socket$SocketInputStream.read` ← `org.bouncycastle.tls.RecordStream.read*` ← `TlsProtocol.safeReadRecord` ← `TlsProtocol.blockForHandshake` ← `TlsServerProtocol.accept` ← `ProvSSLSocketDirect.startHandshake(boolean)` ← **`ProvSSLSocketDirect.startHandshake` (`- locked <ProvSSLSocketDirect@X>`)** ← `PooledProcessor.handshake(PooledProcessor.java:244)` ← `PooledProcessor.run(PooledProcessor.java:181)` |
+| `pool-4-thread-1..5` (terminator) | `WAITING` in `LinkedBlockingQueue.take` | **`BLOCKED (on object monitor)`** in `ProvSSLSocketDirect.close` **`- waiting to lock <ProvSSLSocketDirect@X>`**, the same X held by a `pool-3` thread ← `PooledProcessor.ensureSockClosed(PooledProcessor.java:196)` ← `PooledProcessor.cancelledExecution(PooledProcessor.java:148)` ← `MonitoredPool$Monitor.lambda$terminate` |
+| `BCJSSE-HandshakeCompleted-N` | Short-lived | Should be absent or idle |
+| `Processor` poller threads (`simple.http.Processor`) | `TIMED_WAITING` in the scheduler dequeue, or briefly in `PollerInputStream.peek` | Not involved. If many are stuck in `PollerInputStream.peek` with SO_TIMEOUT 0, report it separately (would contradict section 3.3). |
+
+**Hypotheses the dump rules in or out:**
+
+* **H1:** 30 × `pool-3` in `startHandshake` + 5 × `pool-4` `BLOCKED` in `close` + accept thread in `MonitoredPool.despatch`.
+* **H3:** there is **no** `HTTPS Connection Processor` thread at all, and the log has `Connection Processor is exiting`.
+* **H4:** many sockets in **CLOSE_WAIT** plus threads in `PollerInputStream.peek`.
+
+**Network snapshot at failure time** (PowerShell, as admin):
+
+```powershell
+$p = (Get-Process ws_TunnelService).Id
+Get-NetTCPConnection -LocalPort 443 -OwningProcess $p | Group-Object State | Select Count,Name
+Get-NetTCPConnection -LocalPort 443 -OwningProcess $p -State Established |
+  Sort-Object CreationTime | Select -First 40 RemoteAddress,RemotePort,CreationTime
+```
+
+What to look for under H1 (the netstat from this incident already shows all of these, see 2.5):
+
+* About **30 ESTABLISHED** sockets that are hours old (CreationTime). These are the 30 stuck handshake threads. Expect some to come from the CS's own IP (the 15-minute self-connector).
+* Plus up to 30 more recent sockets for the queued tasks, which become **CLOSE_WAIT** once those clients give up.
+* `Listen` still present.
+* More sockets (ESTABLISHED or CLOSE_WAIT) that were never accepted: these are in the listen backlog. They don't appear in the tunnel's `Accepted connection` log.
+* CLOSE_WAIT **is** expected here (queued and backlog sockets the tunnel never touches). It does **not** indicate the `PollerInputStream` leak (H4).
+
+---
+
+## 8. Repro for R&D (lab only)
+
+From any host, open 70 TCP connections to a test CS on 443 and send nothing:
+
+```bash
+python3 - <<'EOF'
+import socket, time
+s = [socket.create_connection(("test-cs.lab", 443)) for _ in range(70)]
+time.sleep(7200)
+EOF
+```
+
+Expected on 2606 (and very likely on 2603/2512):
+
+* Within about 10–60 s, `Overrunning connection processor … cancelled` appears ×5 and then stops.
+* `Connection processor pool full` appears.
+* `https://test-cs.lab/admin` gets ERR_CONNECTION_REFUSED.
+* Tunnel CPU rises.
+* Killing the script does **not** recover the listener. Only a restart does.
+
+With 6.1 or 5.1 applied, every stalled socket is dropped after about 15 s and `/admin` stays reachable. Because 60 idle TCP connections are enough to take down the listener, R&D should also review this as a **DoS exposure** of the Connection Server.
+
+---
+
+## 9. Recommendation
+
+1. **Now:** apply workaround 6.1 (`-Dorg.bouncycastle.jsse.handshakeTimeoutMillis=15000`) on the internal CS nodes. Before the change, collect one thread dump and the `Get-NetTCPConnection` output at failure time to confirm H1 (section 7).
+2. **Now, in parallel:** identify the process on each CS that connects to its own port 443 every 15 minutes (section 6.2). Fix it or stop it. Check whether the external nodes don't run it; that would further explain why they are unaffected.
+3. **2606 hotfix:** fixes 5.1 + 5.2 (small, self-contained in `thirdparty/simple-3.1.3`). Optionally 5.3 / 5.4.
+4. **Forward-port** the same changes to `release/2609` and `main`. **2609 (including PR #8805) does not fix this.**
+
+---
+
+## 10. Customer `locked.properties` review (dayhview8cs03)
+
+```
+allowUnexpectedHost=true
+checkOrigin=false
+enableCORS=false
+balancedHost=myviewdesktop.daysup.com
+portalhost.1=dayhview8cs01.daysup.com
+portalhost.2=dayhview8cs02.daysup.com
+portalhost.3=dayhview8cs03.daysup.com
+hstsFlags="max-age=31536000; includeSubDomains"
+```
+
+**Nothing here affects the 443 listener or the TLS handshake.** No `socketBacklog`, `handshakeLifetime`, congestion thresholds, or `simple.http.connect.pool.*` settings are set. This file does not cause or relieve the port-443 lock-up, and sections 2–9 still apply.
+
+Two lines are wrong and should be fixed as separate hygiene items:
+
+| Line | Problem | Effect | Fix |
+|---|---|---|---|
+| `portalhost.1..3` | The key is case-sensitive. `Ice.java` reads `config.getPropertyList("portalHost")`. `PropertiesConfigurationProperties` matches the regex `portalHost\.\d+`. | All 3 entries are **silently ignored**, so the portal-host set is empty. This only works because `allowUnexpectedHost=true` disables Host-header validation. | Rename them to `portalHost.1/.2/.3`. After that, try removing `allowUnexpectedHost=true`. |
+| `hstsFlags` | `RequestInfo.addSecurityHeaders()` already emits `max-age=<hstsMaxAge>`, then appends the flags verbatim, quotes included. | The header becomes `Strict-Transport-Security: max-age=<default>; "max-age=31536000; includeSubDomains"`. It is malformed (duplicate directive, quoted token), and browsers may ignore the whole HSTS policy. | Use `hstsMaxAge=31536000` and `hstsFlags=includeSubDomains`, with no quotes. |
+
+Other notes:
+- `allowUnexpectedHost=true` and `checkOrigin=false` weaken security (Host-header and Origin validation are off). Keep them only if the LB/UAG topology really needs them.
+- The file has CRLF line endings and no newline at the end. Both are harmless.
+
